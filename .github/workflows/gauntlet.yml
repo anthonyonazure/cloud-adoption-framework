@@ -1,4 +1,8 @@
 name: gauntlet
+# gauntlet-generator: 708605418dfc
+# Regenerate with `arm-gauntlet.ts --upgrade`. A repo whose stamp differs from
+# the installer's is running an older set of gates, which is what the sweep
+# checks rather than guessing from what the file happens to contain.
 on:
   push:
   pull_request:
@@ -19,15 +23,21 @@ concurrency:
   # structurally impossible instead of merely unlikely.
   group: gauntlet-gates-${{ github.ref }}
   cancel-in-progress: true
+# Read-only by default, and every job that needs more says so itself. The
+# default token is otherwise write-capable across the repository, so a scanner
+# that pulls a compromised package is a scanner that can push to main. Only
+# codeql widens this, and only to publish its own findings.
+permissions:
+  contents: read
 jobs:
   secrets:
     name: secret scan (gitleaks)
     runs-on: ubuntu-latest
     container:
-      image: zricethezav/gitleaks:latest
+      image: zricethezav/gitleaks:latest@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with: { fetch-depth: 0 }
+        with: { fetch-depth: 0, persist-credentials: false }
       # gitleaks CLI is license-free; the gitleaks-action wrapper is NOT (it requires
       # a paid GITLEAKS_LICENSE on org accounts). Run the binary directly to avoid that.
       - name: secret scan
@@ -65,6 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { persist-credentials: false }
       - name: scan lockfiles for known vulnerabilities
         run: |
           curl -sSfL -o osv-scanner \
@@ -89,6 +100,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { persist-credentials: false }
       - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           format: cyclonedx-json
@@ -104,6 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { persist-credentials: false }
       - name: inventory dependency licences
         run: |
           curl -sSfL -o osv-scanner \
@@ -135,9 +148,10 @@ jobs:
     name: static analysis (semgrep)
     runs-on: ubuntu-latest
     container:
-      image: semgrep/semgrep:latest
+      image: semgrep/semgrep:latest@sha256:51c9f53a4fce0d55e9abd08d7b96968654248a4b1122e77f20e0a49c0072446c
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { persist-credentials: false }
       - name: advisory scan (all severities, never blocks)
         run: |
           git config --global --add safe.directory "$(pwd)"
@@ -170,3 +184,94 @@ jobs:
           fi
           if [ "$code" -ne 0 ]; then exit "$code"; fi
           echo "GATE sast = VERIFIED (no ERROR-severity findings across $targets files)" >> "$GITHUB_STEP_SUMMARY"
+  pipeline:
+    name: pipeline security (zizmor, actionlint)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { persist-credentials: false }
+      - name: audit the workflows that run every other gate
+        # Versions resolved when this repo was armed, not "latest" at run time:
+        # a gate whose scanner can change under it is a gate whose verdict can
+        # change without a commit. --upgrade moves both forward deliberately.
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ZIZMOR_VERSION: "1.30.0"
+        run: |
+          shopt -s nullglob
+          set -- .github/workflows/*.yml .github/workflows/*.yaml
+          if [ "$#" -eq 0 ]; then
+            echo "GATE pipeline = NOT_APPLICABLE (this repo has no workflow files to audit)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=GATE pipeline NOT_APPLICABLE::this repo has no workflow files to audit — nothing was checked, so this tick verifies nothing"
+            exit 0
+          fi
+          echo "auditing $# workflow file(s)" >> "$GITHUB_STEP_SUMMARY"
+
+          curl -sSfL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"             | tar xz -C /usr/local/bin actionlint
+          pipx install "zizmor==${ZIZMOR_VERSION}" >/dev/null
+          actionlint --version
+          zizmor --version
+
+          set +e
+          actionlint -no-color "$@" 2>&1 | tee actionlint.out; lint=${PIPESTATUS[0]}
+          zizmor --no-progress --min-severity=medium "$@" 2>&1 | tee zizmor.out; zz=${PIPESTATUS[0]}
+          set -e
+          echo "actionlint exit=$lint  zizmor exit=$zz"
+
+          # tee, not a bare redirect: findings that reach only the step summary
+          # are invisible in the log, and the log is where anyone looking at a
+          # red tick starts. The first version of this gate hid its own failure
+          # that way and cost an extra round trip to diagnose.
+          {
+            echo "### pipeline security"
+            echo '<pre>'
+            cat actionlint.out
+            cat zizmor.out
+            echo '</pre>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # zizmor exits 14 for "findings at or above the threshold" and 0 for
+          # none. Any other non-zero is the tool failing to run, which must not
+          # read as a pass: a crashed scanner and a clean repo both print
+          # nothing useful.
+          if [ "$zz" -ne 0 ] && [ "$zz" -ne 14 ]; then
+            echo "GATE pipeline = FAILED (zizmor could not complete, exit $zz — nothing was audited)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [ "$zz" -eq 14 ] || [ "$lint" -ne 0 ]; then
+            echo "GATE pipeline = FAILED (see the findings above)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "GATE pipeline = VERIFIED ($# workflow file(s) audited, no findings at medium or above)" >> "$GITHUB_STEP_SUMMARY"
+  supplychain:
+    name: supply chain posture (scorecard) — ADVISORY
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { persist-credentials: false }
+      - name: score this repository's own practices
+        env:
+          GITHUB_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCORECARD_VERSION: "5.5.0"
+        run: |
+          curl -sSfL "https://github.com/ossf/scorecard/releases/download/v${SCORECARD_VERSION}/scorecard_${SCORECARD_VERSION}_linux_amd64.tar.gz"             | tar xz -C /usr/local/bin scorecard
+          set +e
+          scorecard --repo="github.com/${{ github.repository }}" --format=default > scorecard.out 2>&1; code=$?
+          set -e
+          {
+            echo "### supply chain posture (advisory, never blocks)"
+            echo '<pre>'
+            cat scorecard.out
+            echo '</pre>'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -ne 0 ] || ! grep -q "Aggregate score" scorecard.out; then
+            echo "TIER supplychain = NOT_ARMED (scorecard could not read this repository; it needs a public repo or a token with read access)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=scorecard NOT_ARMED::supply chain posture was not measured"
+            exit 0
+          fi
+          echo "TIER supplychain = REPORTED ($(grep 'Aggregate score' scorecard.out))" >> "$GITHUB_STEP_SUMMARY"
