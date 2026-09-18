@@ -1,18 +1,30 @@
 name: gauntlet
-# gauntlet-generator: 708605418dfc
+# gauntlet-generator: a591be70b4ae
 # Regenerate with `arm-gauntlet.ts --upgrade`. A repo whose stamp differs from
 # the installer's is running an older set of gates, which is what the sweep
 # checks rather than guessing from what the file happens to contain.
 on:
+  # Push runs only on the branch this repo publishes from. Every other branch is
+  # checked by its pull request instead. Triggering on both used to run the whole
+  # gauntlet TWICE for every push to an open pull request, once under each name,
+  # and the two never cancelled each other because GitHub files them under
+  # different refs. On 2026-09-15 a fleet-wide upgrade did that across every repo
+  # and cost more in two days than the rest of the month. A branch pushed with no
+  # pull request is no longer checked until one is opened, which is when a check
+  # can block anything.
   push:
+    branches: ["main"]
   pull_request:
   # A repo you have not touched in three months has not been checked in three
   # months, while new vulnerabilities against what it already ships are
   # published daily. The dependency and secret gates are time-sensitive, not
-  # edit-sensitive, so the whole gauntlet re-runs on a clock as well as on a
-  # commit. Silence is not the same as safety.
+  # edit-sensitive, so the whole gauntlet also re-runs on a clock. Weekly, not
+  # daily: across a fleet of private repos a daily run was the single largest
+  # line on the bill, and GitHub's own security alerts, which cost nothing, still
+  # flag a newly published vulnerability the day it lands. Silence is not the
+  # same as safety, and neither is a bill nobody expected.
   schedule:
-    - cron: "17 6 * * *"
+    - cron: "17 6 * * 1"
   workflow_dispatch:
 concurrency:
   # A literal, not ${{ github.workflow }}. That expression is the workflow's
@@ -31,6 +43,7 @@ permissions:
   contents: read
 jobs:
   secrets:
+    timeout-minutes: 90
     name: secret scan (gitleaks)
     runs-on: ubuntu-latest
     container:
@@ -71,6 +84,7 @@ jobs:
           scanned=$(printf '%s' "$out" | grep -Eo '[0-9]+ commits scanned' | tail -1)
           echo "GATE secrets = VERIFIED (no leaks in $scanned)" >> "$GITHUB_STEP_SUMMARY"
   deps:
+    timeout-minutes: 90
     name: dependency CVEs (osv-scanner)
     runs-on: ubuntu-latest
     steps:
@@ -81,8 +95,19 @@ jobs:
           curl -sSfL -o osv-scanner \
             https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64
           chmod +x osv-scanner
+          # Reviewed exceptions from .gauntlet.json become "$@". Directories
+          # only: osv-scanner cannot skip a single file.
+          if [ ! -f .github/gauntlet-scan-exceptions ]; then
+            echo "SCAN EXCEPTIONS = FAILED (.github/gauntlet-scan-exceptions is missing, so .gauntlet.json cannot be read; re-arm with --upgrade)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=scan exceptions::.github/gauntlet-scan-exceptions is missing, so .gauntlet.json cannot be read. Re-arm with --upgrade."
+            exit 1
+          fi
+          exc_dir=$(mktemp -d)
+          python3 .github/gauntlet-scan-exceptions osv "$exc_dir" report
+          set --
+          while IFS= read -r exc_arg; do set -- "$@" "$exc_arg"; done < "$exc_dir/args"
           set +e
-          ./osv-scanner scan source --recursive ./
+          ./osv-scanner scan source --recursive "$@" ./
           code=$?
           set -e
           # 0 = clean. 1 = vulnerabilities found, and that must fail the build.
@@ -96,6 +121,7 @@ jobs:
           fi
           exit $code
   sbom:
+    timeout-minutes: 90
     name: software bill of materials
     runs-on: ubuntu-latest
     steps:
@@ -112,6 +138,7 @@ jobs:
           path: sbom.cyclonedx.json
           retention-days: 365
   licenses:
+    timeout-minutes: 90
     name: licence policy
     runs-on: ubuntu-latest
     steps:
@@ -145,17 +172,27 @@ jobs:
           fi
           echo "GATE licences = VERIFIED" >> "$GITHUB_STEP_SUMMARY"
   sast:
+    timeout-minutes: 90
     name: static analysis (semgrep)
     runs-on: ubuntu-latest
     container:
-      image: semgrep/semgrep:latest@sha256:51c9f53a4fce0d55e9abd08d7b96968654248a4b1122e77f20e0a49c0072446c
+      image: semgrep/semgrep:latest@sha256:34ab619bf1391a24bfda3f05debd0d8a6ce3093c2d5f9d39cfc00f83c1397823
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with: { persist-credentials: false }
       - name: advisory scan (all severities, never blocks)
         run: |
           git config --global --add safe.directory "$(pwd)"
-          semgrep scan --config=p/default --metrics=off --no-error \
+          if [ ! -f .github/gauntlet-scan-exceptions ]; then
+            echo "SCAN EXCEPTIONS = FAILED (.github/gauntlet-scan-exceptions is missing, so .gauntlet.json cannot be read; re-arm with --upgrade)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=scan exceptions::.github/gauntlet-scan-exceptions is missing, so .gauntlet.json cannot be read. Re-arm with --upgrade."
+            exit 1
+          fi
+          exc_dir=$(mktemp -d)
+          python3 .github/gauntlet-scan-exceptions semgrep "$exc_dir" quiet
+          set --
+          while IFS= read -r exc_arg; do set -- "$@" "$exc_arg"; done < "$exc_dir/args"
+          semgrep scan --config=p/default --metrics=off --no-error "$@" \
             --text --output=advisory.txt . || true
           {
             echo "### Semgrep advisory findings (not blocking)"
@@ -168,8 +205,17 @@ jobs:
           # Repeated deliberately: each step must stand on its own, so that
           # deleting the step above can never silently disarm this one.
           git config --global --add safe.directory "$(pwd)"
+          if [ ! -f .github/gauntlet-scan-exceptions ]; then
+            echo "SCAN EXCEPTIONS = FAILED (.github/gauntlet-scan-exceptions is missing, so .gauntlet.json cannot be read; re-arm with --upgrade)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=scan exceptions::.github/gauntlet-scan-exceptions is missing, so .gauntlet.json cannot be read. Re-arm with --upgrade."
+            exit 1
+          fi
+          exc_dir=$(mktemp -d)
+          python3 .github/gauntlet-scan-exceptions semgrep "$exc_dir" report
+          set --
+          while IFS= read -r exc_arg; do set -- "$@" "$exc_arg"; done < "$exc_dir/args"
           set +e
-          out=$(semgrep scan --config=p/default --metrics=off --severity=ERROR --error . 2>&1); code=$?
+          out=$(semgrep scan --config=p/default --metrics=off --severity=ERROR --error "$@" . 2>&1); code=$?
           set -e
           echo "$out"
           targets=$(printf '%s' "$out" | awk '/Ran [0-9]+ rules? on [0-9]+ files?:/ { n = $5 } END { if (n != "") print n }')
@@ -185,6 +231,7 @@ jobs:
           if [ "$code" -ne 0 ]; then exit "$code"; fi
           echo "GATE sast = VERIFIED (no ERROR-severity findings across $targets files)" >> "$GITHUB_STEP_SUMMARY"
   pipeline:
+    timeout-minutes: 90
     name: pipeline security (zizmor, actionlint)
     runs-on: ubuntu-latest
     permissions:
@@ -198,7 +245,7 @@ jobs:
         # change without a commit. --upgrade moves both forward deliberately.
         env:
           ACTIONLINT_VERSION: "1.7.12"
-          ZIZMOR_VERSION: "1.30.0"
+          ZIZMOR_VERSION: "1.30.1"
         run: |
           shopt -s nullglob
           set -- .github/workflows/*.yml .github/workflows/*.yaml
@@ -246,6 +293,7 @@ jobs:
           fi
           echo "GATE pipeline = VERIFIED ($# workflow file(s) audited, no findings at medium or above)" >> "$GITHUB_STEP_SUMMARY"
   supplychain:
+    timeout-minutes: 90
     name: supply chain posture (scorecard) — ADVISORY
     runs-on: ubuntu-latest
     permissions:
